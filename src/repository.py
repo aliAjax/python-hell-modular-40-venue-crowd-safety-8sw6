@@ -200,3 +200,245 @@ class SQLiteRepository:
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
         return True
+
+    @staticmethod
+    def _load_medical_point(row):
+        data = json.loads(row["data"])
+        return (
+            int(data.get("capacity", 0)),
+            int(data.get("patients", 0)),
+            int(data.get("reserved", 0)),
+        )
+
+    def _write_medical_point(self, connection, medical_point_id, data):
+        now = utcnow()
+        connection.execute(
+            "UPDATE entities SET version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(data, ensure_ascii=False, sort_keys=True), now, medical_point_id),
+        )
+
+    def _write_transfer(self, connection, transfer_id, status, data):
+        now = utcnow()
+        connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+            (status, json.dumps(data, ensure_ascii=False, sort_keys=True), now, transfer_id),
+        )
+
+    def create_transfer_atomic(self, transfer_id, incident_id, medical_point_id, commander_id):
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            mp_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (medical_point_id,)
+            ).fetchone()
+            if not mp_row:
+                raise NotFoundError("medical point not found: " + medical_point_id)
+            if mp_row["status"] != "active":
+                raise ConflictError("medical point is not accepting patients")
+            capacity, patients, reserved = self._load_medical_point(mp_row)
+            if capacity - patients - reserved <= 0:
+                raise ConflictError("no available beds: bed occupied")
+            active_rows = connection.execute(
+                "SELECT id, data FROM entities WHERE kind = 'transfer' "
+                "AND status IN ('reserved', 'dispatched')",
+            ).fetchall()
+            for row in active_rows:
+                if json.loads(row["data"]).get("incident_id") == incident_id:
+                    raise ConflictError("incident already has an active transfer")
+            mp_data = json.loads(mp_row["data"])
+            mp_data["reserved"] = reserved + 1
+            self._write_medical_point(connection, medical_point_id, mp_data)
+            transfer_data = {
+                "incident_id": incident_id,
+                "medical_point_id": medical_point_id,
+                "task_id": None,
+                "commander_id": commander_id,
+                "bed_held": True,
+            }
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'transfer', 'reserved', 1, ?, ?, ?, ?)",
+                (
+                    transfer_id,
+                    json.dumps(transfer_data, ensure_ascii=False, sort_keys=True),
+                    commander_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(transfer_id)
+
+    def reserve_bed_for_transfer(self, transfer_id, medical_point_id):
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            mp_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (medical_point_id,)
+            ).fetchone()
+            if not mp_row:
+                raise NotFoundError("medical point not found: " + medical_point_id)
+            capacity, patients, reserved = self._load_medical_point(mp_row)
+            if capacity - patients - reserved <= 0:
+                raise ConflictError("no available beds: bed occupied")
+            mp_data = json.loads(mp_row["data"])
+            mp_data["reserved"] = reserved + 1
+            self._write_medical_point(connection, medical_point_id, mp_data)
+            t_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (transfer_id,)
+            ).fetchone()
+            if not t_row:
+                raise NotFoundError("transfer not found: " + transfer_id)
+            tdata = json.loads(t_row["data"])
+            tdata["bed_held"] = True
+            self._write_transfer(connection, transfer_id, t_row["status"], tdata)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(transfer_id)
+
+    def release_bed_for_transfer(self, transfer_id, medical_point_id):
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            mp_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (medical_point_id,)
+            ).fetchone()
+            if not mp_row:
+                raise NotFoundError("medical point not found: " + medical_point_id)
+            _, _, reserved = self._load_medical_point(mp_row)
+            mp_data = json.loads(mp_row["data"])
+            mp_data["reserved"] = max(0, reserved - 1)
+            self._write_medical_point(connection, medical_point_id, mp_data)
+            t_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (transfer_id,)
+            ).fetchone()
+            if not t_row:
+                raise NotFoundError("transfer not found: " + transfer_id)
+            tdata = json.loads(t_row["data"])
+            tdata["bed_held"] = False
+            self._write_transfer(connection, transfer_id, t_row["status"], tdata)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(transfer_id)
+
+    def receive_transfer_atomic(self, transfer_id, medical_point_id):
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            mp_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (medical_point_id,)
+            ).fetchone()
+            if not mp_row:
+                raise NotFoundError("medical point not found: " + medical_point_id)
+            _, patients, reserved = self._load_medical_point(mp_row)
+            mp_data = json.loads(mp_row["data"])
+            mp_data["reserved"] = max(0, reserved - 1)
+            mp_data["patients"] = patients + 1
+            self._write_medical_point(connection, medical_point_id, mp_data)
+            t_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (transfer_id,)
+            ).fetchone()
+            if not t_row:
+                raise NotFoundError("transfer not found: " + transfer_id)
+            tdata = json.loads(t_row["data"])
+            tdata["bed_held"] = False
+            tdata["received_at"] = utcnow()
+            self._write_transfer(connection, transfer_id, "received", tdata)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(transfer_id)
+
+    def void_transfer_atomic(self, transfer_id, medical_point_id):
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            t_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (transfer_id,)
+            ).fetchone()
+            if not t_row:
+                raise NotFoundError("transfer not found: " + transfer_id)
+            tdata = json.loads(t_row["data"])
+            if tdata.get("bed_held"):
+                mp_row = connection.execute(
+                    "SELECT * FROM entities WHERE id = ?", (medical_point_id,)
+                ).fetchone()
+                if mp_row:
+                    _, _, reserved = self._load_medical_point(mp_row)
+                    mp_data = json.loads(mp_row["data"])
+                    mp_data["reserved"] = max(0, reserved - 1)
+                    self._write_medical_point(connection, medical_point_id, mp_data)
+            tdata["bed_held"] = False
+            tdata["voided_at"] = utcnow()
+            self._write_transfer(connection, transfer_id, "void", tdata)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(transfer_id)
+
+    def transition_medical_point(self, medical_point_id, expected_version, next_status, new_data, void_transfers=False):
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            mp_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (medical_point_id,)
+            ).fetchone()
+            if not mp_row:
+                raise NotFoundError("medical point not found: " + medical_point_id)
+            if expected_version is not None and int(mp_row["version"]) != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, mp_row["version"])
+                )
+            now = utcnow()
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+                (next_status, json.dumps(new_data, ensure_ascii=False, sort_keys=True), now, medical_point_id),
+            )
+            if void_transfers:
+                _, _, reserved = self._load_medical_point(mp_row)
+                rows = connection.execute(
+                    "SELECT id, data FROM entities WHERE kind = 'transfer' "
+                    "AND status IN ('reserved', 'dispatched')",
+                ).fetchall()
+                released = 0
+                for row in rows:
+                    tdata = json.loads(row["data"])
+                    if tdata.get("medical_point_id") != medical_point_id:
+                        continue
+                    if tdata.get("bed_held"):
+                        released += 1
+                        tdata["bed_held"] = False
+                    tdata["voided_at"] = now
+                    self._write_transfer(connection, row["id"], "void", tdata)
+                if released:
+                    updated = dict(new_data)
+                    updated["reserved"] = max(0, reserved - released)
+                    self._write_medical_point(connection, medical_point_id, updated)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(medical_point_id)

@@ -70,7 +70,31 @@ def _validate_medical_point(actor, data, lookup):
         raise ValidationError("medical point zone must belong to the venue")
     if int(data.get("capacity", 0)) <= 0:
         raise ValidationError("medical point capacity must be positive")
-    return {"patients": 0}
+    return {"patients": 0, "reserved": 0}
+
+
+def _validate_transfer(actor, data, lookup):
+    incident = _find_one(lookup, "incident", "id", data.get("incident_id"))
+    if not incident:
+        raise ValidationError("incident does not exist")
+    if incident["status"] != "triaged":
+        raise ConflictError("incident must be triaged before transfer")
+    medical_point = _find_one(lookup, "medical_point", "id", data.get("medical_point_id"))
+    if not medical_point:
+        raise ValidationError("medical point does not exist")
+    if medical_point["data"].get("venue_id") != incident["data"].get("venue_id"):
+        raise ValidationError("medical point must belong to the incident's venue")
+    if medical_point["status"] != "active":
+        raise ConflictError("medical point is not accepting patients")
+    capacity = int(medical_point["data"].get("capacity", 0))
+    patients = int(medical_point["data"].get("patients", 0))
+    reserved = int(medical_point["data"].get("reserved", 0))
+    if capacity - patients - reserved <= 0:
+        raise ConflictError("no available beds: bed occupied")
+    active_transfers = lookup("transfer", "incident_id", incident["id"]) or []
+    if any(t["status"] in ("reserved", "dispatched") for t in active_transfers):
+        raise ConflictError("incident already has an active transfer")
+    return {}
 
 
 def _validate_incident(actor, data, lookup):
@@ -155,6 +179,7 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "transfers": "transfer",
     }
     INITIAL_STATUS = {
         "venue": "ready",
@@ -164,6 +189,7 @@ class RuleEngine:
         "medical_point": "standby",
         "incident": "reported",
         "task": "draft",
+        "transfer": "reserved",
     }
     TRANSITIONS = {
         "venue": {
@@ -209,6 +235,11 @@ class RuleEngine:
             "complete": (("on_scene",), "completed"),
             "cancel": (("draft", "assigned", "enroute", "on_scene"), "cancelled"),
         },
+        "transfer": {
+            "dispatch": (("reserved",), "dispatched"),
+            "receive": (("dispatched",), "received"),
+            "void": (("reserved", "dispatched"), "void"),
+        },
     }
     CREATE_REQUIRED = {
         "venue": ("name", "address"),
@@ -218,6 +249,7 @@ class RuleEngine:
         "medical_point": ("venue_id", "zone_id", "capacity", "equipment_level"),
         "incident": ("venue_id", "zone_id", "source_ref", "incident_type", "severity", "reported_at"),
         "task": ("incident_id", "venue_id", "zone_id", "team_id", "task_type"),
+        "transfer": ("incident_id", "medical_point_id"),
     }
     ACTION_REQUIRED = {
         ("venue", "limit"): ("reason", "capacity_limit"),
@@ -244,6 +276,9 @@ class RuleEngine:
         ("task", "arrive"): ("arrived_at",),
         ("task", "complete"): ("completed_at", "outcome"),
         ("task", "cancel"): ("reason",),
+        ("transfer", "dispatch"): ("team_id", "task_type"),
+        ("transfer", "receive"): (),
+        ("transfer", "void"): (),
     }
     CREATE_ROLES = {
         "venue": ("coordinator", "admin"),
@@ -253,6 +288,7 @@ class RuleEngine:
         "medical_point": ("supervisor", "coordinator", "admin"),
         "incident": ("operator", "supervisor", "coordinator", "admin"),
         "task": ("supervisor", "coordinator", "admin"),
+        "transfer": ("coordinator", "admin"),
     }
     ROLE_ACTIONS = {
         "limit": ("coordinator", "supervisor", "admin"),
@@ -276,6 +312,9 @@ class RuleEngine:
         "arrive": ("operator", "supervisor", "admin"),
         "complete": ("operator", "supervisor", "admin"),
         "cancel": ("supervisor", "coordinator", "admin"),
+        "dispatch": ("coordinator", "admin"),
+        "receive": ("coordinator", "supervisor", "admin"),
+        "void": ("coordinator", "admin"),
     }
     CUSTOM_CREATE = {
         "venue": _validate_venue,
@@ -285,6 +324,7 @@ class RuleEngine:
         "medical_point": _validate_medical_point,
         "incident": _validate_incident,
         "task": _validate_task,
+        "transfer": _validate_transfer,
     }
     CUSTOM_TRANSITIONS = {
         ("zone", "admit"): _validate_zone_admit,

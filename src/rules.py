@@ -70,7 +70,7 @@ def _validate_medical_point(actor, data, lookup):
         raise ValidationError("medical point zone must belong to the venue")
     if int(data.get("capacity", 0)) <= 0:
         raise ValidationError("medical point capacity must be positive")
-    return {"patients": 0}
+    return {"patients": 0, "beds_held": 0}
 
 
 def _validate_incident(actor, data, lookup):
@@ -93,6 +93,86 @@ def _validate_task(actor, data, lookup):
     if not _find_one(lookup, "zone", "id", data.get("zone_id")):
         raise ValidationError("task zone does not exist")
     return {}
+
+
+# Transfer orders hold a bed from reserved/dispatched; released orders already
+# returned the bed, void orders were invalidated, received orders consumed it.
+TRANSFER_HELD_STATUSES = ("reserved", "dispatched")
+TRANSFER_OPEN_STATUSES = ("reserved", "dispatched", "released", "void")
+TRANSFER_DISPATCHABLE = ("reserved", "released")
+
+
+def medical_point_open(point):
+    return point is not None and point["status"] == "active"
+
+
+def held_beds(point, lookup, ignore_transfer_id=None):
+    """Beds currently pre-occupied by not-yet-received transfer orders."""
+    held = 0
+    for transfer in lookup("transfer", "medical_point_id", point["id"]) or []:
+        if transfer["id"] == ignore_transfer_id:
+            continue
+        if transfer["status"] in TRANSFER_HELD_STATUSES:
+            held += int(transfer["data"].get("beds", 1))
+    return held
+
+
+def assert_bed_capacity(point, lookup, extra=0, ignore_transfer_id=None):
+    patients = int(point["data"].get("patients", 0))
+    total_held = held_beds(point, lookup, ignore_transfer_id) + extra
+    capacity = int(point["data"].get("capacity", 0))
+    if patients + total_held > capacity:
+        raise ConflictError("medical point beds are already occupied")
+
+
+def _active_incident_transfer(incident_id, lookup, ignore_transfer_id=None):
+    for transfer in lookup("transfer", "incident_id", incident_id) or []:
+        if transfer["id"] != ignore_transfer_id and transfer["status"] in TRANSFER_OPEN_STATUSES:
+            return transfer
+    return None
+
+
+def _validate_transfer(actor, data, lookup):
+    incident = _find_one(lookup, "incident", "id", data.get("incident_id"))
+    if not incident:
+        raise ValidationError("incident does not exist")
+    if incident["status"] != "triaged":
+        raise ConflictError("incident must be triaged before a bed is reserved")
+    point = _find_one(lookup, "medical_point", "id", data.get("medical_point_id"))
+    if not medical_point_open(point):
+        raise ConflictError("medical point is not accepting transfers")
+    if point["data"].get("venue_id") != incident["data"].get("venue_id"):
+        raise ValidationError("medical point must belong to the incident venue")
+    existing = _active_incident_transfer(incident["id"], lookup)
+    if existing:
+        raise ConflictError("incident already has transfer order " + existing["id"])
+    assert_bed_capacity(point, lookup, extra=int(data.get("beds", 1)))
+    return {
+        "venue_id": incident["data"].get("venue_id"),
+        "beds": int(data.get("beds", 1)),
+        "attempts": 0,
+    }
+
+
+def _validate_transfer_dispatch(actor, entity, data, lookup):
+    if entity["status"] not in TRANSFER_DISPATCHABLE:
+        raise InvalidTransition("cannot dispatch transfer from status %s" % entity["status"])
+    _team_available(lookup, data.get("team_id"))
+    return {}
+
+
+def _validate_transfer_reselect(actor, entity, data, lookup):
+    point = _find_one(lookup, "medical_point", "id", data.get("medical_point_id"))
+    if not medical_point_open(point):
+        raise ConflictError("medical point is not accepting transfers")
+    incident = _find_one(lookup, "incident", "id", entity["data"].get("incident_id"))
+    if incident and point["data"].get("venue_id") != incident["data"].get("venue_id"):
+        raise ValidationError("medical point must belong to the incident venue")
+    assert_bed_capacity(
+        point, lookup, extra=int(entity["data"].get("beds", 1)), ignore_transfer_id=entity["id"]
+    )
+    return {}
+
 
 
 def _validate_zone_admit(actor, entity, data, lookup):
@@ -130,11 +210,17 @@ def _validate_gate_open(actor, entity, data, lookup):
     return {"opened_by": actor.user_id}
 
 
-def _validate_task_assign(actor, entity, data, lookup):
+def _team_available(lookup, team_id, ignore_task_id=None):
     active = {"assigned", "enroute", "on_scene"}
-    for task in lookup("task", "team_id", entity["data"].get("team_id")) or []:
-        if task["id"] != entity["id"] and task["status"] in active:
+    if not team_id:
+        raise ValidationError("team_id is required")
+    for task in lookup("task", "team_id", team_id) or []:
+        if task["id"] != ignore_task_id and task["status"] in active:
             raise ConflictError("team already has an active task")
+
+
+def _validate_task_assign(actor, entity, data, lookup):
+    _team_available(lookup, entity["data"].get("team_id"), entity["id"])
     return {"assigned_by": actor.user_id}
 
 
@@ -155,6 +241,7 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "transfers": "transfer",
     }
     INITIAL_STATUS = {
         "venue": "ready",
@@ -164,6 +251,7 @@ class RuleEngine:
         "medical_point": "standby",
         "incident": "reported",
         "task": "draft",
+        "transfer": "reserved",
     }
     TRANSITIONS = {
         "venue": {
@@ -209,6 +297,13 @@ class RuleEngine:
             "complete": (("on_scene",), "completed"),
             "cancel": (("draft", "assigned", "enroute", "on_scene"), "cancelled"),
         },
+        "transfer": {
+            "dispatch": (("reserved", "released"), "dispatched"),
+            "receive": (("dispatched",), "received"),
+            "release": (("reserved", "dispatched"), "released"),
+            "void": (("reserved", "dispatched", "released"), "void"),
+            "reselect": (("void",), "reserved"),
+        },
     }
     CREATE_REQUIRED = {
         "venue": ("name", "address"),
@@ -218,6 +313,7 @@ class RuleEngine:
         "medical_point": ("venue_id", "zone_id", "capacity", "equipment_level"),
         "incident": ("venue_id", "zone_id", "source_ref", "incident_type", "severity", "reported_at"),
         "task": ("incident_id", "venue_id", "zone_id", "team_id", "task_type"),
+        "transfer": ("incident_id", "medical_point_id"),
     }
     ACTION_REQUIRED = {
         ("venue", "limit"): ("reason", "capacity_limit"),
@@ -244,6 +340,11 @@ class RuleEngine:
         ("task", "arrive"): ("arrived_at",),
         ("task", "complete"): ("completed_at", "outcome"),
         ("task", "cancel"): ("reason",),
+        ("transfer", "dispatch"): ("team_id",),
+        ("transfer", "receive"): ("receiver_id", "received_at"),
+        ("transfer", "release"): ("reason",),
+        ("transfer", "void"): ("reason",),
+        ("transfer", "reselect"): ("medical_point_id",),
     }
     CREATE_ROLES = {
         "venue": ("coordinator", "admin"),
@@ -253,6 +354,7 @@ class RuleEngine:
         "medical_point": ("supervisor", "coordinator", "admin"),
         "incident": ("operator", "supervisor", "coordinator", "admin"),
         "task": ("supervisor", "coordinator", "admin"),
+        "transfer": ("supervisor", "coordinator", "admin"),
     }
     ROLE_ACTIONS = {
         "limit": ("coordinator", "supervisor", "admin"),
@@ -276,6 +378,10 @@ class RuleEngine:
         "arrive": ("operator", "supervisor", "admin"),
         "complete": ("operator", "supervisor", "admin"),
         "cancel": ("supervisor", "coordinator", "admin"),
+        "receive": ("operator", "supervisor", "coordinator", "admin"),
+        "release": ("supervisor", "coordinator", "admin"),
+        "void": ("supervisor", "coordinator", "admin"),
+        "reselect": ("supervisor", "coordinator", "admin"),
     }
     CUSTOM_CREATE = {
         "venue": _validate_venue,
@@ -285,6 +391,7 @@ class RuleEngine:
         "medical_point": _validate_medical_point,
         "incident": _validate_incident,
         "task": _validate_task,
+        "transfer": _validate_transfer,
     }
     CUSTOM_TRANSITIONS = {
         ("zone", "admit"): _validate_zone_admit,
@@ -292,6 +399,8 @@ class RuleEngine:
         ("gate", "open"): _validate_gate_open,
         ("incident", "correct"): _validate_correct,
         ("task", "assign"): _validate_task_assign,
+        ("transfer", "dispatch"): _validate_transfer_dispatch,
+        ("transfer", "reselect"): _validate_transfer_reselect,
     }
 
     def normalize_kind(self, kind):

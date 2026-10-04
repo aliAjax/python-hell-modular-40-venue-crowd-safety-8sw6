@@ -15,7 +15,8 @@ class SQLiteRepository:
         self._initialize()
 
     def _connect(self):
-        connection = sqlite3.connect(self.path, timeout=30)
+        # autocommit mode: every multi-row use case opens an explicit BEGIN IMMEDIATE
+        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -196,7 +197,105 @@ class SQLiteRepository:
                 (actor_id, idem_key, entity_id, utcnow()),
             )
 
+    def run_in_transaction(self, work):
+        """Run ``work(tx)`` inside a single-writer transaction.
+
+        BEGIN IMMEDIATE serializes competing use cases (e.g. two commanders
+        reserving the last bed): the first connection takes the write lock,
+        the rest block until it commits and then see the held beds.
+        """
+        connection = self._connect()
+        tx = Transaction(connection)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            result = work(tx)
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def ping(self):
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
         return True
+
+
+class Transaction:
+    """Single-connection read/write handle used inside one unit of work."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def _row(self, entity_id):
+        return self.connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+
+    def get(self, entity_id):
+        row = self._row(entity_id)
+        return SQLiteRepository._entity_from_row(row) if row else None
+
+    def list(self, kind):
+        rows = self.connection.execute(
+            "SELECT * FROM entities WHERE kind = ? ORDER BY created_at, id", (kind,)
+        ).fetchall()
+        return [SQLiteRepository._entity_from_row(row) for row in rows]
+
+    def insert(self, entity_id, kind, status, data, actor_id, created_at=None):
+        stamp = created_at or utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        self.connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+            (entity_id, kind, status, payload, actor_id, stamp, stamp),
+        )
+
+    def update(self, entity_id, expected_version, status, data, updated_at=None):
+        stamp = updated_at or utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        cursor = self.connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (status, payload, stamp, entity_id, int(expected_version)),
+        )
+        if cursor.rowcount == 0:
+            row = self._row(entity_id)
+            if not row:
+                raise NotFoundError("entity not found: " + entity_id)
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, int(row["version"]))
+            )
+
+    def audit(self, entity_id, actor, action, from_status, to_status, detail=None):
+        self.connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor.user_id,
+                actor.role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail or {}, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
+
+    def get_idempotency(self, actor_id, idem_key):
+        row = self.connection.execute(
+            "SELECT entity_id FROM idempotency WHERE actor_id = ? AND idem_key = ?",
+            (actor_id, idem_key),
+        ).fetchone()
+        return row["entity_id"] if row else None
+
+    def save_idempotency(self, actor_id, idem_key, entity_id):
+        self.connection.execute(
+            "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (actor_id, idem_key, entity_id, utcnow()),
+        )
